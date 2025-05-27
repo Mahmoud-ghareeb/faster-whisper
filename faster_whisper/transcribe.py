@@ -7,6 +7,7 @@ import zlib
 from dataclasses import asdict, dataclass
 from inspect import signature
 from math import ceil
+from multiprocessing import Pool, cpu_count
 from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
 from warnings import warn
 
@@ -284,7 +285,7 @@ class BatchedInferencePipeline:
         without_timestamps: bool = True,
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
-        prepend_punctuations: str = "\"'“¿([{-",
+        prepend_punctuations: str = "\"'" "¿([{-",
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         multilingual: bool = False,
         vad_filter: bool = True,
@@ -735,45 +736,69 @@ class BatchedInferencePipeline:
         text_only=False,
     ):
         """
-        Optimized version that can return text only results
+        Optimized version that can return text only results with parallel batch processing
+        while maintaining segment order
         """
+
+        def process_batch(batch_data):
+            batch_idx, batch_features, batch_metadata = batch_data
+            results = self.forward(
+                batch_features,
+                tokenizer,
+                batch_metadata,
+                options,
+            )
+            processed_segments = []
+            for result in results:
+                for segment in result:
+                    if text_only:
+                        processed_segments.append(segment["text"])
+                    else:
+                        processed_segments.append(
+                            Segment(
+                                seek=segment["seek"],
+                                id=0,  # Will be set later
+                                text=segment["text"],
+                                start=round(segment["start"], 3),
+                                end=round(segment["end"], 3),
+                                words=(
+                                    None
+                                    if not options.word_timestamps
+                                    else [Word(**word) for word in segment["words"]]
+                                ),
+                                tokens=segment["tokens"],
+                                avg_logprob=segment["avg_logprob"],
+                                no_speech_prob=segment["no_speech_prob"],
+                                compression_ratio=segment["compression_ratio"],
+                                temperature=options.temperatures[0],
+                            )
+                        )
+            return batch_idx, processed_segments
+
+        # Prepare batches with their indices
+        batches = []
+        for i in range(0, len(features), batch_size):
+            batch_features = features[i : i + batch_size]
+            batch_metadata = chunks_metadata[i : i + batch_size]
+            batch_idx = i // batch_size
+            batches.append((batch_idx, batch_features, batch_metadata))
+
+        # Use number of CPU cores - 1 to leave one core free for other tasks
+        num_workers = max(1, cpu_count() - 1)
+
         pbar = tqdm(total=len(features), disable=not log_progress, position=0)
         seg_idx = 0
 
-        for i in range(0, len(features), batch_size):
-            results = self.forward(
-                features[i : i + batch_size],
-                tokenizer,
-                chunks_metadata[i : i + batch_size],
-                options,
-            )
-
-            for result in results:
-                for segment in result:
+        # Process batches in parallel while maintaining order
+        with Pool(processes=num_workers) as pool:
+            # Use imap to maintain order
+            for batch_idx, batch_results in pool.imap(process_batch, batches):
+                for segment in batch_results:
                     seg_idx += 1
-                    if text_only:
-                        # return text only
-                        yield segment["text"]
-                    else:
-                        yield Segment(
-                            seek=segment["seek"],
-                            id=seg_idx,
-                            text=segment["text"],
-                            start=round(segment["start"], 3),
-                            end=round(segment["end"], 3),
-                            words=(
-                                None
-                                if not options.word_timestamps
-                                else [Word(**word) for word in segment["words"]]
-                            ),
-                            tokens=segment["tokens"],
-                            avg_logprob=segment["avg_logprob"],
-                            no_speech_prob=segment["no_speech_prob"],
-                            compression_ratio=segment["compression_ratio"],
-                            temperature=options.temperatures[0],
-                        )
-
-                pbar.update(1)
+                    if not text_only:
+                        segment.id = seg_idx
+                    yield segment
+                    pbar.update(1)
 
         pbar.close()
         self.last_speech_timestamp = 0.0
@@ -934,7 +959,7 @@ class WhisperModel:
         without_timestamps: bool = False,
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
-        prepend_punctuations: str = "\"'“¿([{-",
+        prepend_punctuations: str = "\"'" "¿([{-",
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         multilingual: bool = False,
         vad_filter: bool = False,
@@ -1290,7 +1315,7 @@ class WhisperModel:
             zip(seek_points[::2], seek_points[1::2])
         )
 
-        punctuation = "\"'“¿([{-\"'.。,，!！?？:：”)]}、"
+        punctuation = "\"'¿([{-\"'.。,，!！?？:：" ")]}、"
 
         idx = 0
         clip_idx = 0
