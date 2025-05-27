@@ -545,6 +545,22 @@ class BatchedInferencePipeline:
 
         return segments, info
 
+    @staticmethod
+    def _process_single_audio_and_extract_features(
+        audio_data, sampling_rate, feature_extractor_func
+    ):
+        """
+        Decodes a single audio and extracts its features.
+        Designed to be run in parallel processes.
+        """
+        if not isinstance(audio_data, np.ndarray):
+            audio_data = decode_audio(audio_data, sampling_rate=sampling_rate)
+
+        # Ensure the feature extractor is called correctly, potentially handling
+        # different input shapes or types if your actual feature_extractor requires it.
+        feature = feature_extractor_func(audio_data)[..., :-1]
+        return audio_data, feature
+
     def transcribe_batch_multiple_audios(
         self,
         audios: List[Union[str, BinaryIO, np.ndarray]],
@@ -601,18 +617,37 @@ class BatchedInferencePipeline:
             )
             multilingual = False
 
+        # --- START: Parallelize audio decoding and feature extraction ---
+        # Use number of CPU cores - 1 for audio processing, similar to inference
+        num_audio_workers = max(1, cpu_count() - 1)
+
         processed_audios = []
-        for audio in audios:
-            if not isinstance(audio, np.ndarray):
-                audio = decode_audio(audio, sampling_rate=sampling_rate)
-            processed_audios.append(audio)
-
         features = []
-        for audio in processed_audios:
-            feature = self.model.feature_extractor(audio)[..., :-1]
-            features.append(feature)
 
-        features = (
+        # Create a list of arguments for each audio to pass to the worker pool
+        audio_processing_args = [
+            (audio, sampling_rate, self.model.feature_extractor) for audio in audios
+        ]
+
+        with Pool(processes=num_audio_workers) as audio_pool:
+            # Use imap_unordered for potentially faster processing if order isn't critical
+            # for this initial step, or imap if order must be strictly preserved.
+            # For now, we'll use imap to maintain original audio order for features/metadata.
+            for processed_audio, feature in tqdm(
+                audio_pool.imap(
+                    self._process_single_audio_and_extract_features_wrapper,
+                    audio_processing_args,
+                ),
+                total=len(audios),
+                desc="Processing audio files",
+                disable=not log_progress,
+            ):
+                processed_audios.append(processed_audio)
+                features.append(feature)
+        # --- END: Parallelize audio decoding and feature extraction ---
+
+        # Stack features into a single NumPy array for batch processing
+        features_stacked = (
             np.stack([pad_or_trim(feature) for feature in features]) if features else []
         )
 
@@ -629,7 +664,7 @@ class BatchedInferencePipeline:
                     all_language_probs,
                 ) = self.model.detect_language(
                     features=np.concatenate(
-                        features
+                        features_stacked
                         + [
                             np.full((self.model.model.n_mels, 1), -1.5, dtype="float32")
                         ],
@@ -701,20 +736,27 @@ class BatchedInferencePipeline:
         info = TranscriptionInfo(
             language=language,
             language_probability=language_probability,
-            duration=processed_audios[0].shape[0] / sampling_rate,
-            duration_after_vad=processed_audios[0].shape[0] / sampling_rate,
+            # Use the duration of the first processed audio for info,
+            # or consider summing durations if info should reflect total.
+            duration=processed_audios[0].shape[0] / sampling_rate
+            if processed_audios
+            else 0,
+            duration_after_vad=processed_audios[0].shape[0] / sampling_rate
+            if processed_audios
+            else 0,
             transcription_options=options,
             vad_options=vad_parameters,
             all_language_probs=all_language_probs,
         )
 
+        # Generate chunks_metadata based on the processed_audios
         chunks_metadata = [
             {"start_time": 0, "end_time": a.shape[0] / sampling_rate}
             for a in processed_audios
         ]
 
         segments = self._batched_segments_generator(
-            features,
+            features_stacked,  # Pass the stacked features
             tokenizer,
             chunks_metadata,
             batch_size,
@@ -725,9 +767,22 @@ class BatchedInferencePipeline:
 
         return segments, info
 
+    # Wrapper for the static method to be called via imap,
+    # allowing it to access self.model.feature_extractor.
+    def _process_single_audio_and_extract_features_wrapper(self, args):
+        """Wrapper to pass instance method to static method for multiprocessing."""
+        (
+            audio_data,
+            sampling_rate,
+            _,
+        ) = args  # Unpack args, feature_extractor_func is not needed from args
+        return self._process_single_audio_and_extract_features(
+            audio_data, sampling_rate, self.model.feature_extractor
+        )
+
     def _batched_segments_generator(
         self,
-        features,
+        features,  # Now receives already stacked features
         tokenizer,
         chunks_metadata,
         batch_size,
@@ -737,11 +792,17 @@ class BatchedInferencePipeline:
     ):
         """
         Optimized version that can return text only results with parallel batch processing
-        while maintaining segment order
+        while maintaining segment order.
+        This function now focuses solely on parallelizing the *inference* part.
         """
 
         def process_batch(batch_data):
+            """
+            Processes a single batch of features through the Whisper model.
+            This function runs in a separate process.
+            """
             batch_idx, batch_features, batch_metadata = batch_data
+            # self.forward calls self.generate_segment_batched which uses GPU
             results = self.forward(
                 batch_features,
                 tokenizer,
@@ -775,8 +836,9 @@ class BatchedInferencePipeline:
                         )
             return batch_idx, processed_segments
 
-        # Prepare batches with their indices
+        # Prepare batches with their indices from the already processed and stacked features
         batches = []
+        # len(features) is now the total number of audio files after initial processing
         for i in range(0, len(features), batch_size):
             batch_features = features[i : i + batch_size]
             batch_metadata = chunks_metadata[i : i + batch_size]
@@ -786,19 +848,26 @@ class BatchedInferencePipeline:
         # Use number of CPU cores - 1 to leave one core free for other tasks
         num_workers = max(1, cpu_count() - 1)
 
-        pbar = tqdm(total=len(features), disable=not log_progress, position=0)
+        pbar = tqdm(
+            total=len(features),
+            disable=not log_progress,
+            position=0,
+            desc="Transcribing batches",
+        )
         seg_idx = 0
 
         # Process batches in parallel while maintaining order
         with Pool(processes=num_workers) as pool:
-            # Use imap to maintain order
+            # Use imap to maintain order of batches
             for batch_idx, batch_results in pool.imap(process_batch, batches):
                 for segment in batch_results:
                     seg_idx += 1
                     if not text_only:
                         segment.id = seg_idx
                     yield segment
-                    pbar.update(1)
+                    pbar.update(
+                        1
+                    )  # Update progress bar for each segment (or audio file)
 
         pbar.close()
         self.last_speech_timestamp = 0.0
