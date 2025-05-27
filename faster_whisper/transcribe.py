@@ -286,7 +286,7 @@ class BatchedInferencePipeline:
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
         prepend_punctuations: str = "\"'" "¿([{-",
-        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        append_punctuations: str = "\"'.。,，!！?？:：" ")]}、",
         multilingual: bool = False,
         vad_filter: bool = True,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
@@ -594,7 +594,7 @@ class BatchedInferencePipeline:
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
         prepend_punctuations: str = "\"'" "¿([{-",
-        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        append_punctuations: str = "\"'.。,，!！?？:：" ")]}、",
         multilingual: bool = False,
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
@@ -829,7 +829,7 @@ class BatchedInferencePipeline:
 
     def _batched_segments_generator(
         self,
-        features,  # Now receives already stacked features
+        features,
         tokenizer,
         chunks_metadata,
         batch_size,
@@ -838,55 +838,45 @@ class BatchedInferencePipeline:
         text_only=False,
     ):
         """
-        Optimized version that can return text only results with parallel batch processing
-        while maintaining segment order.
-        This function now focuses solely on parallelizing the *inference* part.
+        Optimized version that can return text only results
         """
-
-        # Prepare batches with their indices from the already processed and stacked features
-        batches_for_pool = []
-        # len(features) is now the total number of audio files after initial processing
-        for i in range(0, len(features), batch_size):
-            batch_features = features[i : i + batch_size]
-            batch_metadata = chunks_metadata[i : i + batch_size]
-            batch_idx = i // batch_size
-
-            # Pass the instance of BatchedInferencePipeline to the static method
-            batches_for_pool.append(
-                (
-                    self,
-                    (batch_idx, batch_features, batch_metadata),
-                    tokenizer,
-                    options,
-                    text_only,
-                )
-            )
-
-        # Use number of CPU cores - 1 to leave one core free for other tasks
-        num_workers = max(1, cpu_count() - 1)
-
-        pbar = tqdm(
-            total=len(features),
-            disable=not log_progress,
-            position=0,
-            desc="Transcribing batches",
-        )
+        pbar = tqdm(total=len(features), disable=not log_progress, position=0)
         seg_idx = 0
 
-        # Process batches in parallel while maintaining order
-        with Pool(processes=num_workers) as pool:
-            # Use imap to maintain order of batches, calling the new static method
-            for batch_idx, batch_results in pool.imap(
-                BatchedInferencePipeline._process_batch_static, batches_for_pool
-            ):
-                for segment in batch_results:
+        for i in range(0, len(features), batch_size):
+            results = self.forward(
+                features[i : i + batch_size],
+                tokenizer,
+                chunks_metadata[i : i + batch_size],
+                options,
+            )
+
+            for result in results:
+                for segment in result:
                     seg_idx += 1
-                    if not text_only:
-                        segment.id = seg_idx
-                    yield segment
-                    pbar.update(
-                        1
-                    )  # Update progress bar for each segment (or audio file)
+                    if text_only:
+                        # return text only
+                        yield segment["text"]
+                    else:
+                        yield Segment(
+                            seek=segment["seek"],
+                            id=seg_idx,
+                            text=segment["text"],
+                            start=round(segment["start"], 3),
+                            end=round(segment["end"], 3),
+                            words=(
+                                None
+                                if not options.word_timestamps
+                                else [Word(**word) for word in segment["words"]]
+                            ),
+                            tokens=segment["tokens"],
+                            avg_logprob=segment["avg_logprob"],
+                            no_speech_prob=segment["no_speech_prob"],
+                            compression_ratio=segment["compression_ratio"],
+                            temperature=options.temperatures[0],
+                        )
+
+                pbar.update(1)
 
         pbar.close()
         self.last_speech_timestamp = 0.0
@@ -1048,7 +1038,7 @@ class WhisperModel:
         max_initial_timestamp: float = 1.0,
         word_timestamps: bool = False,
         prepend_punctuations: str = "\"'" "¿([{-",
-        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        append_punctuations: str = "\"'.。,，!！?？:：" ")]}、",
         multilingual: bool = False,
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
