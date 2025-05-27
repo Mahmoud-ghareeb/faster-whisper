@@ -780,6 +780,53 @@ class BatchedInferencePipeline:
             audio_data, sampling_rate, self.model.feature_extractor
         )
 
+    @staticmethod
+    def _process_batch_static(args):
+        """
+        Processes a single batch of features through the Whisper model.
+        This function runs in a separate process and is designed to be picklable.
+        It receives the BatchedInferencePipeline instance and batch data.
+        """
+        # Unpack arguments for the static method
+        pipeline_instance, batch_data, tokenizer, options, text_only = args
+
+        batch_idx, batch_features, batch_metadata = batch_data
+
+        # Call the forward method of the provided pipeline instance
+        results = pipeline_instance.forward(
+            batch_features,
+            tokenizer,
+            batch_metadata,
+            options,
+        )
+
+        processed_segments = []
+        for result in results:
+            for segment in result:
+                if text_only:
+                    processed_segments.append(segment["text"])
+                else:
+                    processed_segments.append(
+                        Segment(
+                            seek=segment["seek"],
+                            id=0,  # Will be set later
+                            text=segment["text"],
+                            start=round(segment["start"], 3),
+                            end=round(segment["end"], 3),
+                            words=(
+                                None
+                                if not options.word_timestamps
+                                else [Word(**word) for word in segment["words"]]
+                            ),
+                            tokens=segment["tokens"],
+                            avg_logprob=segment["avg_logprob"],
+                            no_speech_prob=segment["no_speech_prob"],
+                            compression_ratio=segment["compression_ratio"],
+                            temperature=options.temperatures[0],
+                        )
+                    )
+        return batch_idx, processed_segments
+
     def _batched_segments_generator(
         self,
         features,  # Now receives already stacked features
@@ -796,54 +843,24 @@ class BatchedInferencePipeline:
         This function now focuses solely on parallelizing the *inference* part.
         """
 
-        def process_batch(batch_data):
-            """
-            Processes a single batch of features through the Whisper model.
-            This function runs in a separate process.
-            """
-            batch_idx, batch_features, batch_metadata = batch_data
-            # self.forward calls self.generate_segment_batched which uses GPU
-            results = self.forward(
-                batch_features,
-                tokenizer,
-                batch_metadata,
-                options,
-            )
-            processed_segments = []
-            for result in results:
-                for segment in result:
-                    if text_only:
-                        processed_segments.append(segment["text"])
-                    else:
-                        processed_segments.append(
-                            Segment(
-                                seek=segment["seek"],
-                                id=0,  # Will be set later
-                                text=segment["text"],
-                                start=round(segment["start"], 3),
-                                end=round(segment["end"], 3),
-                                words=(
-                                    None
-                                    if not options.word_timestamps
-                                    else [Word(**word) for word in segment["words"]]
-                                ),
-                                tokens=segment["tokens"],
-                                avg_logprob=segment["avg_logprob"],
-                                no_speech_prob=segment["no_speech_prob"],
-                                compression_ratio=segment["compression_ratio"],
-                                temperature=options.temperatures[0],
-                            )
-                        )
-            return batch_idx, processed_segments
-
         # Prepare batches with their indices from the already processed and stacked features
-        batches = []
+        batches_for_pool = []
         # len(features) is now the total number of audio files after initial processing
         for i in range(0, len(features), batch_size):
             batch_features = features[i : i + batch_size]
             batch_metadata = chunks_metadata[i : i + batch_size]
             batch_idx = i // batch_size
-            batches.append((batch_idx, batch_features, batch_metadata))
+
+            # Pass the instance of BatchedInferencePipeline to the static method
+            batches_for_pool.append(
+                (
+                    self,
+                    (batch_idx, batch_features, batch_metadata),
+                    tokenizer,
+                    options,
+                    text_only,
+                )
+            )
 
         # Use number of CPU cores - 1 to leave one core free for other tasks
         num_workers = max(1, cpu_count() - 1)
@@ -858,8 +875,10 @@ class BatchedInferencePipeline:
 
         # Process batches in parallel while maintaining order
         with Pool(processes=num_workers) as pool:
-            # Use imap to maintain order of batches
-            for batch_idx, batch_results in pool.imap(process_batch, batches):
+            # Use imap to maintain order of batches, calling the new static method
+            for batch_idx, batch_results in pool.imap(
+                BatchedInferencePipeline._process_batch_static, batches_for_pool
+            ):
                 for segment in batch_results:
                     seg_idx += 1
                     if not text_only:
