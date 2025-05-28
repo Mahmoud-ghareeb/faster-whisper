@@ -212,6 +212,19 @@ def test_multilingual_transcription(data_dir):
         " die Software zu verwenden, zu vervielfältigen, zu modifizieren"
         in segments[1].text
     )
+    
+    segments = pipeline.transcribe_batch_multiple_audios([audio], multilingual=True, text_only=True)
+
+    assert (
+        segments
+        == " Permission is hereby granted, free of charge, to any person obtaining a copy of the"
+        " software and associated documentation files to deal in the software without restriction,"
+        " including without limitation the rights to use, copy, modify, merge, publish, distribute"
+        ", sublicence, and or cell copies of the software, and to permit persons to whom the "
+        "software is furnished to do so, subject to the following conditions. The above copyright"
+        " notice and this permission notice, shall be included in all copies or substantial "
+        "portions of the software."
+    )
 
 
 def test_hotwords(data_dir):

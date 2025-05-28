@@ -29,6 +29,8 @@ from faster_whisper.vad import (
     merge_segments,
 )
 
+from concurrent.futures import ThreadPoolExecutor
+
 
 @dataclass
 class Word:
@@ -617,31 +619,29 @@ class BatchedInferencePipeline:
             )
             multilingual = False
 
-        # --- START: Parallelize audio decoding and feature extraction ---
-        # Use number of CPU cores - 1 for audio processing, similar to inference
+        # --- START: Parallelize audio decoding and feature extraction using ThreadPoolExecutor ---
+        from concurrent.futures import ThreadPoolExecutor
         num_audio_workers = max(1, cpu_count() - 1)
 
         processed_audios = []
         features = []
 
-        # Create a list of arguments for each audio to pass to the worker pool
         audio_processing_args = [
             (audio, sampling_rate, self.model.feature_extractor) for audio in audios
         ]
 
-        with Pool(processes=num_audio_workers) as audio_pool:
-            # Use imap_unordered for potentially faster processing if order isn't critical
-            # for this initial step, or imap if order must be strictly preserved.
-            # For now, we'll use imap to maintain original audio order for features/metadata.
-            for processed_audio, feature in tqdm(
-                audio_pool.imap(
-                    self._process_single_audio_and_extract_features_wrapper,
-                    audio_processing_args,
-                ),
+        with ThreadPoolExecutor(max_workers=num_audio_workers) as audio_pool:
+            futures = [
+                audio_pool.submit(self._process_single_audio_and_extract_features, *args)
+                for args in audio_processing_args
+            ]
+            for future in tqdm(
+                futures,
                 total=len(audios),
                 desc="Processing audio files",
                 disable=not log_progress,
             ):
+                processed_audio, feature = future.result()
                 processed_audios.append(processed_audio)
                 features.append(feature)
         # --- END: Parallelize audio decoding and feature extraction ---
@@ -762,7 +762,7 @@ class BatchedInferencePipeline:
             batch_size,
             options,
             log_progress,
-            text_only,
+            text_only=text_only,
         )
 
         return segments, info
@@ -838,10 +838,34 @@ class BatchedInferencePipeline:
         text_only=False,
     ):
         """
-        Optimized version that can return text only results
+        Optimized version that can return text only results, with parallel post-processing using threads.
         """
         pbar = tqdm(total=len(features), disable=not log_progress, position=0)
         seg_idx = 0
+
+        def process_segment(segment):
+            nonlocal seg_idx
+            seg_idx += 1
+            if text_only:
+                return segment["text"]
+            else:
+                return Segment(
+                    seek=segment["seek"],
+                    id=seg_idx,
+                    text=segment["text"],
+                    start=round(segment["start"], 3),
+                    end=round(segment["end"], 3),
+                    words=(
+                        None
+                        if not options.word_timestamps
+                        else [Word(**word) for word in segment["words"]]
+                    ),
+                    tokens=segment["tokens"],
+                    avg_logprob=segment["avg_logprob"],
+                    no_speech_prob=segment["no_speech_prob"],
+                    compression_ratio=segment["compression_ratio"],
+                    temperature=options.temperatures[0],
+                )
 
         for i in range(0, len(features), batch_size):
             results = self.forward(
@@ -850,33 +874,12 @@ class BatchedInferencePipeline:
                 chunks_metadata[i : i + batch_size],
                 options,
             )
-
-            for result in results:
-                for segment in result:
-                    seg_idx += 1
-                    if text_only:
-                        # return text only
-                        yield segment["text"]
-                    else:
-                        yield Segment(
-                            seek=segment["seek"],
-                            id=seg_idx,
-                            text=segment["text"],
-                            start=round(segment["start"], 3),
-                            end=round(segment["end"], 3),
-                            words=(
-                                None
-                                if not options.word_timestamps
-                                else [Word(**word) for word in segment["words"]]
-                            ),
-                            tokens=segment["tokens"],
-                            avg_logprob=segment["avg_logprob"],
-                            no_speech_prob=segment["no_speech_prob"],
-                            compression_ratio=segment["compression_ratio"],
-                            temperature=options.temperatures[0],
-                        )
-
-                pbar.update(1)
+            # Flatten all segments in the batch
+            all_segments = [segment for result in results for segment in result]
+            with ThreadPoolExecutor() as executor:
+                for processed in executor.map(process_segment, all_segments):
+                    yield processed
+            pbar.update(len(all_segments))
 
         pbar.close()
         self.last_speech_timestamp = 0.0
