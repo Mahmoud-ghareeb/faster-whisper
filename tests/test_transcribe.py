@@ -239,6 +239,7 @@ def test_transcribe_signature():
     pipeline_transcribe_args = set(
         inspect.getargs(BatchedInferencePipeline.transcribe.__code__).args
     )
+    # batch_size is specific to BatchedInferencePipeline
     pipeline_transcribe_args.remove("batch_size")
 
     assert model_transcribe_args == pipeline_transcribe_args

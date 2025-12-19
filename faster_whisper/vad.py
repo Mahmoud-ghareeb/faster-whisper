@@ -223,57 +223,71 @@ def collect_chunks(
     sampling_rate: int = 16000,
     max_duration: float = float("inf"),
 ) -> Tuple[List[np.ndarray], List[Dict[str, float]]]:
-    """This function merges the chunks of audio into chunks of max_duration (s) length."""
-    if not chunks:
-        chunk_metadata = {
-            "offset": 0,
-            "duration": 0,
-            "segments": [],
-        }
-        return [np.array([], dtype=np.float32)], [chunk_metadata]
+    """Merge speech chunks into segments of max_duration length.
 
+    This function groups VAD-detected speech chunks and merges them into
+    larger audio segments, each not exceeding max_duration seconds.
+
+    Args:
+        audio: Full audio waveform as numpy array.
+        chunks: List of dicts with 'start' and 'end' keys (in samples).
+        sampling_rate: Audio sampling rate in Hz.
+        max_duration: Maximum duration of each output chunk in seconds.
+
+    Returns:
+        Tuple of (audio_chunks, chunks_metadata) where:
+        - audio_chunks: List of audio segment arrays
+        - chunks_metadata: List of dicts with 'offset', 'duration', 'segments'
+    """
+    if not chunks:
+        return [np.array([], dtype=np.float32)], [{"offset": 0, "duration": 0, "segments": []}]
+
+    # Handle infinite max_duration
+    if max_duration == float("inf"):
+        max_samples = float("inf")
+    else:
+        max_samples = int(max_duration * sampling_rate)
+
+    # Pre-compute lengths for all chunks
+    lengths = np.array([c["end"] - c["start"] for c in chunks], dtype=np.int64)
+
+    # Group chunks that fit within max_samples
     audio_chunks = []
     chunks_metadata = []
+    total_offset = 0.0
 
-    current_segments = []
-    current_duration = 0
-    total_duration = 0
-    current_audio = np.array([], dtype=np.float32)
+    i = 0
+    while i < len(chunks):
+        # Find how many consecutive chunks fit in this group
+        current_len = 0
+        group_start = i
+        segments = []
 
-    for chunk in chunks:
-        if (
-            current_duration + chunk["end"] - chunk["start"]
-            > max_duration * sampling_rate
-        ):
-            audio_chunks.append(current_audio)
-            chunk_metadata = {
-                "offset": total_duration / sampling_rate,
-                "duration": current_duration / sampling_rate,
-                "segments": current_segments,
-            }
-            total_duration += current_duration
-            chunks_metadata.append(chunk_metadata)
+        while i < len(chunks):
+            seg_len = lengths[i]
+            if current_len + seg_len > max_samples and current_len > 0:
+                break
+            segments.append(chunks[i])
+            current_len += seg_len
+            i += 1
 
-            current_segments = []
+        # Pre-allocate array for this group and copy all segments at once
+        chunk_audio = np.empty(current_len, dtype=np.float32)
+        pos = 0
+        for seg in segments:
+            seg_len = seg["end"] - seg["start"]
+            chunk_audio[pos:pos + seg_len] = audio[seg["start"]:seg["end"]]
+            pos += seg_len
 
-            current_audio = audio[chunk["start"] : chunk["end"]]
-            current_duration = chunk["end"] - chunk["start"]
-        else:
-            current_segments.append(chunk)
-            current_audio = np.concatenate(
-                (current_audio, audio[chunk["start"] : chunk["end"]])
-            )
+        duration = current_len / sampling_rate
+        chunks_metadata.append({
+            "offset": total_offset,
+            "duration": duration,
+            "segments": segments,
+        })
+        audio_chunks.append(chunk_audio)
+        total_offset += duration
 
-            current_duration += chunk["end"] - chunk["start"]
-
-    audio_chunks.append(current_audio)
-
-    chunk_metadata = {
-        "offset": total_duration / sampling_rate,
-        "duration": current_duration / sampling_rate,
-        "segments": current_segments,
-    }
-    chunks_metadata.append(chunk_metadata)
     return audio_chunks, chunks_metadata
 
 

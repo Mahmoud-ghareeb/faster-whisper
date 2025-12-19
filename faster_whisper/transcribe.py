@@ -251,6 +251,61 @@ class BatchedInferencePipeline:
 
         return encoder_output, output
 
+    def _process_clip_timestamps(
+        self,
+        audio: np.ndarray,
+        clip_timestamps: List[dict],
+        sampling_rate: int,
+    ) -> Tuple[List[np.ndarray], List[dict], List[dict]]:
+        """Process clip_timestamps with vectorized operations.
+
+        Args:
+            audio: Audio waveform as numpy array.
+            clip_timestamps: List of dicts with 'start' and 'end' keys (in seconds).
+            sampling_rate: Audio sampling rate in Hz.
+
+        Returns:
+            Tuple of (audio_chunks, chunks_meta, audio_clip_timestamps) where:
+            - audio_chunks: List of audio segment arrays
+            - chunks_meta: List of metadata dicts
+            - audio_clip_timestamps: List of dicts with sample indices
+        """
+        n_clips = len(clip_timestamps)
+
+        # Vectorized conversion to samples
+        starts = np.array([c["start"] for c in clip_timestamps], dtype=np.float64)
+        ends = np.array([c["end"] for c in clip_timestamps], dtype=np.float64)
+
+        starts_samples = (starts * sampling_rate).astype(np.int64)
+        ends_samples = (ends * sampling_rate).astype(np.int64)
+        durations = (ends_samples - starts_samples) / sampling_rate
+
+        # Warn for long segments (vectorized check)
+        long_indices = np.where(durations > 30)[0]
+        for i in long_indices:
+            self.model.logger.warning(
+                "Segment %d is longer than 30 seconds, "
+                "only the first 30 seconds will be transcribed",
+                i,
+            )
+
+        # Pre-allocate lists
+        audio_chunks = [None] * n_clips
+        chunks_meta = [None] * n_clips
+        audio_clip_timestamps = [None] * n_clips
+
+        for i in range(n_clips):
+            s, e = starts_samples[i], ends_samples[i]
+            audio_chunks[i] = audio[s:e]
+            audio_clip_timestamps[i] = {"start": int(s), "end": int(e)}
+            chunks_meta[i] = {
+                "offset": starts[i],
+                "duration": durations[i],
+                "segments": [audio_clip_timestamps[i]],
+            }
+
+        return audio_chunks, chunks_meta, audio_clip_timestamps
+
     def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray, List[Union[str, BinaryIO, np.ndarray]]],
@@ -290,7 +345,7 @@ class BatchedInferencePipeline:
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
         max_new_tokens: Optional[int] = None,
         chunk_length: Optional[int] = None,
-        clip_timestamps: Optional[List[dict]] = None,
+        clip_timestamps: Optional[Union[List[dict], List[List[dict]]]] = None,
         hallucination_silence_threshold: Optional[float] = None,
         batch_size: int = 8,
         hotwords: Optional[str] = None,
@@ -345,6 +400,8 @@ class BatchedInferencePipeline:
             clip_timestamps: Optionally provide list of dictionaries each containing "start" and
                 "end" keys that specify the start and end of the voiced region within
                 `chunk_length` boundary. vad_filter will be ignored if clip_timestamps is used.
+                For batch processing, can also be a list of lists (one per audio) to provide
+                different timestamps for each audio file.
             batch_size: the maximum number of parallel requests to model for decoding.
             hotwords:
                 Hotwords/hint phrases to the model. Has no effect if prefix is not None.
@@ -412,7 +469,17 @@ class BatchedInferencePipeline:
         audio_infos = []
         audio_boundaries = [0]
 
-        for audio_item in audios:
+        # Determine if per-audio clip_timestamps are provided (List[List[dict]])
+        per_audio_timestamps = None
+        if clip_timestamps is not None:
+            if is_batch and clip_timestamps and isinstance(clip_timestamps[0], list):
+                # Per-audio timestamps: List[List[dict]]
+                per_audio_timestamps = clip_timestamps
+            else:
+                # Shared timestamps or single audio: List[dict]
+                per_audio_timestamps = [clip_timestamps] * len(audios)
+
+        for audio_idx, audio_item in enumerate(audios):
             if not isinstance(audio_item, np.ndarray):
                 audio_item = decode_audio(audio_item, sampling_rate=sampling_rate)
 
@@ -423,30 +490,18 @@ class BatchedInferencePipeline:
             )
 
             audio_clip_timestamps = None
-            clip_timestamps_provided = clip_timestamps is not None
+            current_clip_timestamps = (
+                per_audio_timestamps[audio_idx] if per_audio_timestamps else None
+            )
+            clip_timestamps_provided = current_clip_timestamps is not None
 
             if clip_timestamps_provided:
-                audio_clip_timestamps = [
-                    {k: int(v * sampling_rate) for k, v in segment.items()}
-                    for segment in clip_timestamps
-                ]
-                audio_chunks, chunks_meta = [], []
-                for i, clip in enumerate(audio_clip_timestamps):
-                    audio_chunks.append(audio_item[clip["start"] : clip["end"]])
-                    clip_duration = (clip["end"] - clip["start"]) / sampling_rate
-                    if clip_duration > 30:
-                        self.model.logger.warning(
-                            "Segment %d is longer than 30 seconds, "
-                            "only the first 30 seconds will be transcribed",
-                            i,
-                        )
-                    chunks_meta.append(
-                        {
-                            "offset": clip["start"] / sampling_rate,
-                            "duration": clip_duration,
-                            "segments": [clip],
-                        }
+                # Use optimized helper method for clip_timestamps processing
+                audio_chunks, chunks_meta, audio_clip_timestamps = (
+                    self._process_clip_timestamps(
+                        audio_item, current_clip_timestamps, sampling_rate
                     )
+                )
             elif vad_filter:
                 audio_clip_timestamps = get_speech_timestamps(
                     audio_item, _vad_parameters
@@ -477,6 +532,8 @@ class BatchedInferencePipeline:
                 "VAD filter removed %s of audio",
                 format_timestamp(duration - duration_after_vad),
             )
+
+            # Extract mel spectrogram features
             features = (
                 [
                     self.model.feature_extractor(chunk)[..., :-1]
